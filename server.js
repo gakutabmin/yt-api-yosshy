@@ -2,12 +2,9 @@ import 'dotenv/config';
 import express from 'express';
 import { spawn } from 'node:child_process';
 
-// ------------------------
-// Environment / Constants
-// ------------------------
 const DEFAULT_PORT = 3000;
 const REQUEST_TIMEOUT_MS = 5_000;
-const INSTANCE_BAN_MS = 5 * 60_000;
+const INSTANCE_BAN_MS = 5 * 60 * 1000;
 const YT_DLP_TIMEOUT_MS = 10_000;
 const YT_DLP_STDOUT_LIMIT = 5 * 1024 * 1024;
 const YT_DLP_STDERR_LIMIT = 1 * 1024 * 1024;
@@ -20,8 +17,7 @@ const PROXY_URL = (() => {
 
   try {
     const parsed = new URL(raw);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-    return parsed.toString();
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : null;
   } catch {
     return null;
   }
@@ -29,9 +25,7 @@ const PROXY_URL = (() => {
 
 const PORT = (() => {
   const parsed = Number.parseInt(String(process.env.PORT ?? ''), 10);
-  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535
-    ? parsed
-    : DEFAULT_PORT;
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : DEFAULT_PORT;
 })();
 
 const INVIDIOUS_INSTANCES = [
@@ -45,17 +39,11 @@ const INVIDIOUS_INSTANCES = [
   'https://yewtu.be',
 ];
 
-const MANIFEST_KEYS = ['dashManifestUrl', 'hlsManifestUrl', 'manifestUrl'];
+const MANIFEST_KEYS = ['dashManifestUrl', 'hlsManifestUrl', 'manifestUrl', 'dashUrl', 'hlsUrl'];
 
-// ------------------------
-// App
-// ------------------------
 const app = express();
 app.disable('x-powered-by');
 
-// ------------------------
-// Helpers
-// ------------------------
 class SkipInstanceError extends Error {
   constructor(message) {
     super(message);
@@ -83,9 +71,7 @@ const snippet = (text, len = 220) => {
 
 const parseStrictJsonObject = (text, context = 'json') => {
   const trimmed = String(text ?? '').trim();
-  if (!trimmed) {
-    throw new Error(`${context}: empty output`);
-  }
+  if (!trimmed) throw new Error(`${context}: empty output`);
 
   let parsed;
   try {
@@ -94,10 +80,7 @@ const parseStrictJsonObject = (text, context = 'json') => {
     throw new Error(`${context}: invalid JSON (${snippet(trimmed)})`);
   }
 
-  if (!isPlainObject(parsed)) {
-    throw new Error(`${context}: JSON must be an object`);
-  }
-
+  if (!isPlainObject(parsed)) throw new Error(`${context}: JSON must be an object`);
   return parsed;
 };
 
@@ -107,170 +90,250 @@ const parseHeightFromLabel = (label) => {
 };
 
 const parseUrlFromFormat = (format) => {
-  if (!isPlainObject(format)) return null;
+  if (!format) return null;
+  if (typeof format === 'string') return format;
   if (isNonEmptyString(format.url)) return format.url;
 
-  const cipher = isNonEmptyString(format.signatureCipher) ? format.signatureCipher : null;
+  const cipher = format.signatureCipher || format.signature_cipher || format.cipher;
   if (!cipher) return null;
 
   try {
-    return new URLSearchParams(cipher).get('url');
+    const params = new URLSearchParams(cipher);
+    return params.get('url');
   } catch {
     return null;
   }
 };
 
-const uniqueBy = (items, keyFn) => {
+const inferFormatKind = (format) => {
+  if (!isPlainObject(format)) return null;
+
+  const text = [
+    format.mime,
+    format.mimeType,
+    format.mime_type,
+    format.type,
+    format.container,
+    format.encoding,
+    format.qualityLabel,
+    format.quality_label,
+    format.resolution,
+  ]
+    .filter(isNonEmptyString)
+    .join(' ')
+    .toLowerCase();
+
+  const hasVideoSignals =
+    toNumber(format.width, 0) > 0 ||
+    toNumber(format.height, 0) > 0 ||
+    toNumber(format.fps, 0) > 0 ||
+    isNonEmptyString(format.qualityLabel) ||
+    isNonEmptyString(format.quality_label) ||
+    isNonEmptyString(format.resolution);
+
+  const hasAudioSignals =
+    isNonEmptyString(format.audioQuality) ||
+    isNonEmptyString(format.audioQualityLabel) ||
+    isNonEmptyString(format.audioSampleRate) ||
+    isNonEmptyString(format.audioChannels);
+
+  if (/video/.test(text) && /audio/.test(text)) return 'muxed';
+  if (/audio/.test(text) && !/video/.test(text)) return 'audio';
+  if (/video/.test(text) && !/audio/.test(text)) return 'video';
+  if (hasVideoSignals && hasAudioSignals) return 'muxed';
+  if (hasVideoSignals) return 'video';
+  if (hasAudioSignals) return 'audio';
+  return null;
+};
+
+const uniqByKey = (items, keyFn) => {
   const seen = new Set();
   const out = [];
-
   for (const item of items) {
     const key = keyFn(item);
     if (!key || seen.has(key)) continue;
     seen.add(key);
     out.push(item);
   }
-
   return out;
 };
 
-const asObjectArray = (...values) =>
-  values.flatMap((value) => (Array.isArray(value) ? value : [])).filter(isPlainObject);
+const flattenArrays = (...values) => values.flatMap((v) => (Array.isArray(v) ? v : [])).filter(Boolean);
+
+const pickRequestedFormats = (raw = {}, sd = {}) =>
+  flattenArrays(raw.requested_formats, sd.requested_formats, sd.streamingData?.requested_formats).filter(
+    (v) => v && typeof v === 'object'
+  );
+
+const buildSdFromRaw = (raw = {}) => {
+  const sd = {
+    formats: Array.isArray(raw.formats) ? raw.formats : [],
+    requested_formats: Array.isArray(raw.requested_formats) ? raw.requested_formats : [],
+  };
+
+  for (const key of MANIFEST_KEYS) {
+    if (isNonEmptyString(raw[key])) sd[key] = raw[key];
+  }
+
+  if (raw.streamingData && isPlainObject(raw.streamingData)) {
+    sd.streamingData = raw.streamingData;
+  }
+
+  if (Array.isArray(raw.adaptiveFormats)) sd.adaptiveFormats = raw.adaptiveFormats;
+  if (Array.isArray(raw.adaptive_formats)) sd.adaptive_formats = raw.adaptive_formats;
+  if (Array.isArray(raw.formatStreams)) sd.formatStreams = raw.formatStreams;
+
+  return sd;
+};
 
 const collectFormats = (raw = {}, sd = {}) => {
-  const sources = asObjectArray(
+  const sources = flattenArrays(
     raw.formats,
     raw.requested_formats,
     raw.adaptiveFormats,
+    raw.adaptive_formats,
+    raw.formatStreams,
     sd.formats,
     sd.requested_formats,
     sd.adaptiveFormats,
+    sd.adaptive_formats,
+    sd.formatStreams,
     sd.streamingData?.formats,
     sd.streamingData?.requested_formats,
-    sd.streamingData?.adaptiveFormats
+    sd.streamingData?.adaptiveFormats,
+    sd.streamingData?.adaptive_formats,
+    sd.streamingData?.formatStreams
   );
 
   const normalized = sources
-    .map((format) => {
-      const url = parseUrlFromFormat(format);
-      if (!url) return null;
+    .map((f) => {
+      if (!isPlainObject(f)) return null;
 
-      const mime = String(format.mimeType || '').toLowerCase();
-      const vcodec = String(format.vcodec || '').toLowerCase();
-      const acodec = String(format.acodec || '').toLowerCase();
+      const url = parseUrlFromFormat(f);
+      const mime = String(f.mimeType || f.mime_type || f.type || '').toLowerCase();
+      const vcodec = String(f.vcodec || '').toLowerCase();
+      const acodec = String(f.acodec || '').toLowerCase();
 
       return {
-        ...format,
+        ...f,
         url,
         mime,
+        kind: inferFormatKind(f),
         vcodec,
         acodec,
-        width: toNumber(format.width, 0),
-        height: toNumber(format.height || parseHeightFromLabel(format.qualityLabel || format.resolution), 0),
-        fps: toNumber(format.fps, 0),
-        tbr: toNumber(format.tbr || format.bitrate, 0),
-        abr: toNumber(format.abr || format.audioBitrate, 0),
-        vbr: toNumber(format.vbr, 0),
-        filesize: toNumber(format.filesize, 0),
-        filesize_approx: toNumber(format.filesize_approx, 0),
-        qualityLabel: String(format.qualityLabel || format.resolution || ''),
+        width: toNumber(f.width, 0),
+        height: toNumber(f.height || parseHeightFromLabel(f.qualityLabel || f.resolution), 0),
+        fps: toNumber(f.fps, 0),
+        tbr: toNumber(f.tbr || f.bitrate || f.total_bitrate, 0),
+        abr: toNumber(f.abr || f.audioBitrate, 0),
+        vbr: toNumber(f.vbr, 0),
+        filesize: toNumber(f.filesize, 0),
+        filesize_approx: toNumber(f.filesize_approx, 0),
+        qualityLabel: String(f.qualityLabel || f.quality_label || f.resolution || ''),
       };
     })
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((f) => isNonEmptyString(f.url));
 
-  return uniqueBy(normalized, (format) => {
-    return (
-      format.url ||
-      `${String(format.itag || '')}|${String(format.format_id || '')}|${String(format.height || '')}|${String(format.width || '')}|${String(format.mime || '')}`
-    );
-  });
+  return uniqByKey(normalized, (f) =>
+    f.url ||
+    `${String(f.itag || '')}|${String(f.format_id || '')}|${String(f.height || '')}|${String(f.width || '')}|${String(f.mime || '')}`
+  );
 };
 
 const extractTitle = (raw = {}) =>
   raw.title ||
   raw.videoDetails?.title ||
+  raw.video_details?.title ||
   raw.player_response?.videoDetails?.title ||
   raw.basic_info?.title ||
   raw.microformat?.title?.simpleText ||
+  (Array.isArray(raw.titleText?.runs) ? raw.titleText.runs.map((x) => x?.text || '').join('') : null) ||
+  raw.video?.title ||
   null;
 
 const isLiveLike = (raw = {}, sd = {}) =>
-  Boolean(
-    raw.is_live ||
-      raw.isLive ||
-      raw.liveNow ||
-      raw.live ||
-      raw.live_status === 'is_live' ||
-      sd.isLive ||
-      sd.streamingData?.isLive
-  );
+  Boolean(raw.is_live || raw.live_status === 'is_live' || raw.liveNow || raw.isLive || raw.live || sd.isLive);
+
+const isHlsUrl = (url) => /(^|[/?#&])[^?#]*\.m3u8(\?|#|$)/i.test(url) || /mpegurl/i.test(url);
+const isDashUrl = (url) => /(^|[/?#&])[^?#]*\.mpd(\?|#|$)/i.test(url) || /dash/i.test(url);
 
 const extractManifest = (raw = {}, sd = {}, isLive = false) => {
   const candidates = [
     { kind: 'dash', url: sd.dashManifestUrl },
+    { kind: 'dash', url: sd.dash_manifest_url },
+    { kind: 'dash', url: sd.dashUrl },
     { kind: 'hls', url: sd.hlsManifestUrl },
+    { kind: 'hls', url: sd.hls_manifest_url },
+    { kind: 'hls', url: sd.hlsUrl },
     { kind: 'dash', url: raw.dashManifestUrl },
+    { kind: 'dash', url: raw.dash_manifest_url },
+    { kind: 'dash', url: raw.dashUrl },
     { kind: 'hls', url: raw.hlsManifestUrl },
+    { kind: 'hls', url: raw.hls_manifest_url },
+    { kind: 'hls', url: raw.hlsUrl },
     { kind: null, url: sd.manifestUrl },
+    { kind: null, url: sd.manifest_url },
     { kind: null, url: raw.manifestUrl },
-  ].filter((item) => isNonEmptyString(item.url));
+    { kind: null, url: raw.manifest_url },
+  ].filter((x) => isNonEmptyString(x.url));
 
   if (!candidates.length) return null;
 
   const inferKind = (item) => {
     if (item.kind) return item.kind;
-    if (/\.m3u8(\?|#|$)/i.test(item.url)) return 'hls';
-    if (/\.mpd(\?|#|$)/i.test(item.url)) return 'dash';
+    if (isHlsUrl(item.url)) return 'hls';
+    if (isDashUrl(item.url)) return 'dash';
     return 'hls';
   };
 
-  const ordered = candidates.map((item) => ({
-    url: item.url,
-    kind: inferKind(item),
-  }));
-
+  const ordered = candidates.map((item) => ({ url: item.url, kind: inferKind(item) }));
   const preferredKinds = isLive ? ['hls', 'dash'] : ['dash', 'hls'];
+
   for (const kind of preferredKinds) {
-    const hit = ordered.find((item) => item.kind === kind);
+    const hit = ordered.find((x) => x.kind === kind);
     if (hit) return hit;
   }
 
   return ordered[0];
 };
 
-const isMuxedFormat = (format) =>
+const isMuxedFormat = (f) =>
   Boolean(
-    format &&
-      ((format.vcodec && format.vcodec !== 'none' && format.acodec && format.acodec !== 'none') ||
-        (format.mime.includes('video') && format.mime.includes('audio')))
+    f &&
+    ((f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none') ||
+      (String(f.mime || '').includes('video') && String(f.mime || '').includes('audio')) ||
+      f.kind === 'muxed')
   );
 
-const isVideoOnly = (format) =>
+const isVideoOnly = (f) =>
   Boolean(
-    format &&
-      ((format.vcodec && format.vcodec !== 'none' && (!format.acodec || format.acodec === 'none')) ||
-        (format.mime.includes('video') && !format.mime.includes('audio')))
+    f &&
+    ((f.vcodec && f.vcodec !== 'none' && (!f.acodec || f.acodec === 'none')) ||
+      (String(f.mime || '').includes('video') && !String(f.mime || '').includes('audio')) ||
+      f.kind === 'video')
   );
 
-const isAudioOnly = (format) =>
+const isAudioOnly = (f) =>
   Boolean(
-    format &&
-      ((format.acodec && format.acodec !== 'none' && (!format.vcodec || format.vcodec === 'none')) ||
-        (format.mime.includes('audio') && !format.mime.includes('video')))
+    f &&
+    ((f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none')) ||
+      (String(f.mime || '').includes('audio') && !String(f.mime || '').includes('video')) ||
+      f.kind === 'audio')
   );
 
-const scoreVideoFormat = (format) => [
-  toNumber(format.height, 0),
-  toNumber(format.width, 0),
-  toNumber(format.fps, 0),
-  toNumber(format.tbr || format.vbr || format.abr, 0),
-  toNumber(format.filesize_approx || format.filesize, 0),
+const scoreVideoFormat = (f) => [
+  toNumber(f.height, 0),
+  toNumber(f.width, 0),
+  toNumber(f.fps, 0),
+  toNumber(f.tbr || f.vbr || f.abr, 0),
+  toNumber(f.filesize_approx || f.filesize, 0),
 ];
 
-const scoreAudioFormat = (format) => [
-  toNumber(format.abr, 0),
-  toNumber(format.tbr || format.vbr, 0),
-  toNumber(format.filesize_approx || format.filesize, 0),
+const scoreAudioFormat = (f) => [
+  toNumber(f.abr, 0),
+  toNumber(f.tbr || f.vbr, 0),
+  toNumber(f.filesize_approx || f.filesize, 0),
 ];
 
 const compareVideoQuality = (a, b) => {
@@ -291,36 +354,23 @@ const compareAudioQuality = (a, b) => {
   return 0;
 };
 
+const hasPlayableUrl = (f) => isNonEmptyString(f?.url);
+
 const selectBestMuxed = (formats = []) =>
-  [...formats].filter(isMuxedFormat).sort(compareVideoQuality)[0] || null;
+  [...formats].filter((f) => hasPlayableUrl(f) && isMuxedFormat(f)).sort(compareVideoQuality)[0] || null;
 
 const selectBestVideo = (formats = []) =>
-  [...formats].filter(isVideoOnly).sort(compareVideoQuality)[0] ||
-  [...formats].filter((format) => format.mime.includes('video')).sort(compareVideoQuality)[0] ||
+  [...formats].filter((f) => hasPlayableUrl(f) && isVideoOnly(f)).sort(compareVideoQuality)[0] ||
+  [...formats].filter((f) => hasPlayableUrl(f) && String(f.mime || '').includes('video')).sort(compareVideoQuality)[0] ||
   null;
 
 const selectBestAudio = (formats = []) =>
-  [...formats].filter(isAudioOnly).sort(compareAudioQuality)[0] ||
-  [...formats].filter((format) => format.mime.includes('audio')).sort(compareAudioQuality)[0] ||
+  [...formats].filter((f) => hasPlayableUrl(f) && isAudioOnly(f)).sort(compareAudioQuality)[0] ||
+  [...formats].filter((f) => hasPlayableUrl(f) && String(f.mime || '').includes('audio')).sort(compareAudioQuality)[0] ||
   null;
 
-const buildStreamingData = (raw = {}) => {
-  const streamingData = isPlainObject(raw.streamingData) ? raw.streamingData : {};
-
-  return {
-    formats: Array.isArray(raw.formats) ? raw.formats : [],
-    requested_formats: Array.isArray(raw.requested_formats) ? raw.requested_formats : [],
-    adaptiveFormats: Array.isArray(raw.adaptiveFormats) ? raw.adaptiveFormats : [],
-    streamingData,
-    ...Object.fromEntries(
-      MANIFEST_KEYS.filter((key) => isNonEmptyString(raw[key])).map((key) => [key, raw[key]])
-    ),
-    isLive: Boolean(raw.isLive),
-  };
-};
-
 const selectDashFromRequested = (raw = {}, sd = {}) => {
-  const requested = asObjectArray(raw.requested_formats, sd.requested_formats, sd.streamingData?.requested_formats);
+  const requested = pickRequestedFormats(raw, sd);
   if (requested.length < 2) return null;
 
   const normalized = collectFormats({ requested_formats: requested }, {});
@@ -339,8 +389,8 @@ const selectDashFromRequested = (raw = {}, sd = {}) => {
   return null;
 };
 
-const normalizeResourceChoice = (raw = {}, sd = {}) => {
-  const formats = collectFormats(raw, sd);
+const normalizeResourceChoice = (raw = {}, sd = {}, formatsOverride = null) => {
+  const formats = Array.isArray(formatsOverride) ? formatsOverride : collectFormats(raw, sd);
   const live = isLiveLike(raw, sd);
 
   if (live) {
@@ -354,9 +404,7 @@ const normalizeResourceChoice = (raw = {}, sd = {}) => {
   }
 
   const requestedDash = selectDashFromRequested(raw, sd);
-  if (requestedDash?.videourl && requestedDash?.audiourl) {
-    return requestedDash;
-  }
+  if (requestedDash?.videourl && requestedDash?.audiourl) return requestedDash;
 
   const video = selectBestVideo(formats);
   const audio = selectBestAudio(formats);
@@ -374,7 +422,7 @@ const normalizeResourceChoice = (raw = {}, sd = {}) => {
   if (muxed) {
     return {
       kind: 'progressive',
-      url: parseUrlFromFormat(muxed),
+      url: muxed.url,
       source: 'muxed',
     };
   }
@@ -382,9 +430,6 @@ const normalizeResourceChoice = (raw = {}, sd = {}) => {
   return null;
 };
 
-// ------------------------
-// yt-dlp
-// ------------------------
 const runYtDlp = async (videoId, { useProxy = false } = {}) => {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
   const args = [
@@ -397,10 +442,7 @@ const runYtDlp = async (videoId, { useProxy = false } = {}) => {
     'bestvideo*+bestaudio/best',
   ];
 
-  if (useProxy && PROXY_URL) {
-    args.push('--proxy', PROXY_URL);
-  }
-
+  if (useProxy && PROXY_URL) args.push('--proxy', PROXY_URL);
   args.push(url);
 
   return new Promise((resolve, reject) => {
@@ -448,19 +490,12 @@ const runYtDlp = async (videoId, { useProxy = false } = {}) => {
       stderr += chunk.toString('utf8');
     });
 
-    child.on('error', (err) => {
-      done(err);
-    });
+    child.on('error', (err) => done(err));
 
     child.on('close', (code, signal) => {
       if (settled) return;
-
       if (code !== 0) {
-        done(
-          new Error(
-            `yt-dlp failed (${code ?? signal ?? 'unknown'}): ${snippet(stderr) || 'no stderr output'}`
-          )
-        );
+        done(new Error(`yt-dlp failed (${code ?? signal ?? 'unknown'}): ${snippet(stderr) || 'no stderr output'}`));
         return;
       }
 
@@ -473,9 +508,6 @@ const runYtDlp = async (videoId, { useProxy = false } = {}) => {
   });
 };
 
-// ------------------------
-// Invidious
-// ------------------------
 const badInstances = new Map();
 let rrIndex = 0;
 
@@ -490,8 +522,8 @@ const rotateInstances = (list = []) => {
   rrIndex = (rrIndex + 1) % list.length;
 
   const rotated = [...list.slice(start), ...list.slice(0, start)];
-
   const now = Date.now();
+
   const available = rotated.filter((instance) => {
     const time = badInstances.get(instance);
     if (!time) return true;
@@ -540,14 +572,15 @@ const fastestFetch = async (instances, buildUrl, parser) => {
 
         const parsed = parser(json);
         if (!parsed) {
+          markInstanceBad(base);
           throw new Error(`parse failed from ${base}`);
         }
 
         return { instance: base, data: parsed };
       } catch (err) {
-        if (!(err instanceof SkipInstanceError)) {
-          const aborted = err?.name === 'AbortError';
-          if (timedOut || !aborted) markInstanceBad(base);
+        const aborted = err?.name === 'AbortError';
+        if (!(err instanceof SkipInstanceError) && (timedOut || !aborted)) {
+          markInstanceBad(base);
         }
         throw err;
       } finally {
@@ -560,26 +593,33 @@ const fastestFetch = async (instances, buildUrl, parser) => {
     const result = await Promise.any(tasks);
     controllers.forEach((controller) => controller.abort());
     return result;
-  } catch (err) {
+  } catch {
     controllers.forEach((controller) => controller.abort());
-    throw err instanceof AggregateError ? new Error('All instances failed') : err;
+    throw new Error('All instances failed');
   }
 };
 
 const parseInvidiousVideo = (data) => {
   if (!isPlainObject(data)) return null;
 
-  const sd = buildStreamingData(data);
-  const live = Boolean(data.liveNow || data.isLive || data.is_live || data.live || data.live_status === 'is_live' || sd.isLive);
+  const sd = buildSdFromRaw(data);
+  const formats = collectFormats(data, sd);
+  const live = Boolean(
+    data.liveNow || data.isLive || data.is_live || data.live || data.live_status === 'is_live' || sd.streamingData?.isLive
+  );
 
   if (live) {
     throw new SkipInstanceError('skip live on invidious');
   }
 
   return {
-    streaming_data: sd,
+    streaming_data: {
+      ...sd,
+      formats,
+    },
     is_live: live,
     raw: data,
+    formats,
   };
 };
 
@@ -587,7 +627,7 @@ const fetchFromYtDlp = async (id, { useProxy = false } = {}) => {
   const raw = await runYtDlp(id, { useProxy });
   if (!isPlainObject(raw)) throw new Error('yt-dlp returned non-object JSON');
 
-  const sd = buildStreamingData(raw);
+  const sd = buildSdFromRaw(raw);
   const formats = collectFormats(raw, sd);
   const live = isLiveLike(raw, sd);
 
@@ -614,6 +654,7 @@ const fetchFromInvidious = async (id) => {
     streaming_data: result.data.streaming_data,
     is_live: result.data.is_live,
     raw: result.data.raw,
+    formats: result.data.formats,
   };
 };
 
@@ -638,6 +679,7 @@ const fetchStreamingInfo = async (id) => {
 const buildStreamResponse = ({ info, raw, sd, title, res }) => {
   const formats = collectFormats(raw, sd);
   const live = isLiveLike(raw, sd);
+  const effectiveFormats = formats.length ? formats : Array.isArray(info?.formats) ? info.formats : [];
 
   if (live) {
     const manifest = extractManifest(raw, sd, true);
@@ -653,11 +695,11 @@ const buildStreamResponse = ({ info, raw, sd, title, res }) => {
     });
   }
 
-  if (!formats.length) {
+  if (!effectiveFormats.length) {
     return res.status(404).json({ error: 'no stream' });
   }
 
-  const choice = normalizeResourceChoice(raw, sd);
+  const choice = normalizeResourceChoice(raw, sd, effectiveFormats);
   if (!choice) {
     return res.status(404).json({ error: 'no stream' });
   }
@@ -687,9 +729,6 @@ const buildStreamResponse = ({ info, raw, sd, title, res }) => {
   return res.status(404).json({ error: 'no stream' });
 };
 
-// ------------------------
-// API
-// ------------------------
 app.get('/api/stream', async (req, res) => {
   try {
     const id = String(req.query.id || '').trim();
@@ -708,7 +747,4 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// ------------------------
-// Server start
-// ------------------------
 app.listen(PORT, () => console.log(`Server running on ${PORT}`));
