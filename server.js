@@ -39,7 +39,7 @@ const INVIDIOUS_INSTANCES = [
   'https://yewtu.be',
 ];
 
-const MANIFEST_KEYS = ['manifestUrl', 'dashUrl', 'hlsUrl'];
+const MANIFEST_KEYS = ['dashUrl', 'hlsUrl'];
 
 const app = express();
 app.disable('x-powered-by');
