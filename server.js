@@ -11,6 +11,7 @@ const YT_DLP_STDERR_LIMIT = 1 * 1024 * 1024;
 const YT_ID_REGEX = /^[a-zA-Z0-9_-]{11}$/;
 
 const YT_DLP_BIN = process.env.YT_DLP_BIN || '/opt/venv/bin/yt-dlp';
+
 const PROXY_URL = (() => {
   const raw = process.env.PROXY_URL;
   if (!raw) return null;
@@ -39,7 +40,16 @@ const INVIDIOUS_INSTANCES = [
   'https://yewtu.be',
 ];
 
-const MANIFEST_KEYS = ['dashManifestUrl', 'hlsManifestUrl', 'manifestUrl', 'dashUrl', 'hlsUrl'];
+const TITLE_PATH = 'title';
+
+const MANIFEST_FIELD_GROUPS = [
+  { kind: 'dash', key: 'dashUrl' },
+  { kind: 'hls', key: 'hlsUrl' },
+  { kind: 'hls', key: 'manifest_url' },
+];
+
+const VIDEO_SCORE_RULES = ['height', 'width', 'fps', 'tbr', 'filesize_approx', 'filesize'];
+const AUDIO_SCORE_RULES = ['abr', 'tbr', 'filesize_approx', 'filesize'];
 
 const app = express();
 app.disable('x-powered-by');
@@ -84,9 +94,50 @@ const parseStrictJsonObject = (text, context = 'json') => {
   return parsed;
 };
 
+const getPathValue = (source, path) => {
+  if (!isPlainObject(source) && !Array.isArray(source)) return undefined;
+
+  const parts = Array.isArray(path) ? path : String(path).split('.');
+  let current = source;
+
+  for (const part of parts) {
+    if (current == null) return undefined;
+    current = current?.[part];
+  }
+
+  return current;
+};
+
+const firstDefined = (...values) => {
+  for (const value of values) {
+    if (value !== undefined && value !== null) return value;
+  }
+  return null;
+};
+
+const firstNonEmptyString = (...values) => {
+  for (const value of values) {
+    if (isNonEmptyString(value)) return String(value).trim();
+  }
+  return null;
+};
+
+const firstStringFromPaths = (source, paths) => {
+  for (const path of paths) {
+    const value = getPathValue(source, path);
+    if (isNonEmptyString(value)) return String(value).trim();
+  }
+  return null;
+};
+
+const concatTextRuns = (runs) =>
+  Array.isArray(runs)
+    ? runs.map((part) => part?.text || '').join('').trim() || null
+    : null;
+
 const parseHeightFromLabel = (label) => {
-  const m = String(label || '').match(/(\d{3,4})p/i);
-  return m ? Number(m[1]) : 0;
+  const match = String(label || '').match(/(\d{3,4})p/i);
+  return match ? Number(match[1]) : 0;
 };
 
 const parseUrlFromFormat = (format) => {
@@ -105,10 +156,23 @@ const parseUrlFromFormat = (format) => {
   }
 };
 
+const normalizeFormatKindToken = (value) => {
+  const token = firstNonEmptyString(value)?.toLowerCase();
+  if (!token) return null;
+
+  if (token === 'progressive') return 'muxed';
+  if (token === 'combined') return 'muxed';
+  if (token === 'video' || token === 'audio' || token === 'muxed') return token;
+  return null;
+};
+
 const inferFormatKind = (format) => {
   if (!isPlainObject(format)) return null;
 
-  const text = [
+  const explicit = normalizeFormatKindToken(format.kind);
+  if (explicit) return explicit;
+
+  const mimeText = [
     format.mime,
     format.mimeType,
     format.mime_type,
@@ -123,7 +187,10 @@ const inferFormatKind = (format) => {
     .join(' ')
     .toLowerCase();
 
-  const hasVideoSignals =
+  const codecText = [format.vcodec, format.acodec].filter(isNonEmptyString).join(' ').toLowerCase();
+  const text = `${mimeText} ${codecText}`;
+
+  const hasVideoSignal =
     toNumber(format.width, 0) > 0 ||
     toNumber(format.height, 0) > 0 ||
     toNumber(format.fps, 0) > 0 ||
@@ -131,18 +198,23 @@ const inferFormatKind = (format) => {
     isNonEmptyString(format.quality_label) ||
     isNonEmptyString(format.resolution);
 
-  const hasAudioSignals =
+  const hasAudioSignal =
     isNonEmptyString(format.audioQuality) ||
     isNonEmptyString(format.audioQualityLabel) ||
     isNonEmptyString(format.audioSampleRate) ||
     isNonEmptyString(format.audioChannels);
 
-  if (/video/.test(text) && /audio/.test(text)) return 'muxed';
-  if (/audio/.test(text) && !/video/.test(text)) return 'audio';
-  if (/video/.test(text) && !/audio/.test(text)) return 'video';
-  if (hasVideoSignals && hasAudioSignals) return 'muxed';
-  if (hasVideoSignals) return 'video';
-  if (hasAudioSignals) return 'audio';
+  const mentionsVideo = /video|avc|vp9|vp8|av01|h264|h265|hevc/.test(text);
+  const mentionsAudio = /audio|aac|opus|mp4a|vorbis|flac|mp3/.test(text);
+
+  if (mentionsVideo && mentionsAudio) return 'muxed';
+  if (mentionsAudio && !mentionsVideo) return 'audio';
+  if (mentionsVideo && !mentionsAudio) return 'video';
+
+  if (hasVideoSignal && hasAudioSignal) return 'muxed';
+  if (hasVideoSignal) return 'video';
+  if (hasAudioSignal) return 'audio';
+
   return null;
 };
 
@@ -158,11 +230,49 @@ const uniqByKey = (items, keyFn) => {
   return out;
 };
 
-const flattenArrays = (...values) => values.flatMap((v) => (Array.isArray(v) ? v : [])).filter(Boolean);
+const flattenArrays = (...values) => values.flatMap((value) => (Array.isArray(value) ? value : [])).filter(Boolean);
+
+const normalizeFormat = (format) => {
+  if (!isPlainObject(format)) return null;
+
+  const url = parseUrlFromFormat(format);
+  const mime = firstNonEmptyString(format.mimeType, format.mime_type, format.type)?.toLowerCase() || '';
+  const vcodec = firstNonEmptyString(format.vcodec)?.toLowerCase() || '';
+  const acodec = firstNonEmptyString(format.acodec)?.toLowerCase() || '';
+  const kind = inferFormatKind(format);
+
+  return {
+    ...format,
+    url,
+    mime,
+    vcodec,
+    acodec,
+    kind,
+    width: toNumber(format.width, 0),
+    height: toNumber(firstDefined(format.height, parseHeightFromLabel(firstNonEmptyString(format.qualityLabel, format.resolution))), 0),
+    fps: toNumber(format.fps, 0),
+    tbr: toNumber(firstDefined(format.tbr, format.bitrate, format.total_bitrate), 0),
+    abr: toNumber(firstDefined(format.abr, format.audioBitrate), 0),
+    vbr: toNumber(format.vbr, 0),
+    filesize: toNumber(format.filesize, 0),
+    filesize_approx: toNumber(format.filesize_approx, 0),
+    qualityLabel: firstNonEmptyString(format.qualityLabel, format.quality_label, format.resolution) || '',
+  };
+};
+
+const normalizeFormatList = (formats = []) =>
+  uniqByKey(
+    (Array.isArray(formats) ? formats : [])
+      .map((format) => normalizeFormat(format))
+      .filter((format) => Boolean(format) && isNonEmptyString(format.url)),
+    (format) =>
+      format.url ||
+      `${String(format.itag || '')}|${String(format.format_id || '')}|${String(format.height || '')}|${String(format.width || '')}|${String(format.mime || '')}`
+  );
 
 const pickRequestedFormats = (raw = {}, sd = {}) =>
   flattenArrays(raw.requested_formats, sd.requested_formats, sd.streamingData?.requested_formats).filter(
-    (v) => v && typeof v === 'object'
+    (value) => value && typeof value === 'object'
   );
 
 const buildSdFromRaw = (raw = {}) => {
@@ -170,10 +280,6 @@ const buildSdFromRaw = (raw = {}) => {
     formats: Array.isArray(raw.formats) ? raw.formats : [],
     requested_formats: Array.isArray(raw.requested_formats) ? raw.requested_formats : [],
   };
-
-  for (const key of MANIFEST_KEYS) {
-    if (isNonEmptyString(raw[key])) sd[key] = raw[key];
-  }
 
   if (raw.streamingData && isPlainObject(raw.streamingData)) {
     sd.streamingData = raw.streamingData;
@@ -205,193 +311,156 @@ const collectFormats = (raw = {}, sd = {}) => {
     sd.streamingData?.formatStreams
   );
 
-  const normalized = sources
-    .map((f) => {
-      if (!isPlainObject(f)) return null;
-
-      const url = parseUrlFromFormat(f);
-      const mime = String(f.mimeType || f.mime_type || f.type || '').toLowerCase();
-      const vcodec = String(f.vcodec || '').toLowerCase();
-      const acodec = String(f.acodec || '').toLowerCase();
-
-      return {
-        ...f,
-        url,
-        mime,
-        kind: inferFormatKind(f),
-        vcodec,
-        acodec,
-        width: toNumber(f.width, 0),
-        height: toNumber(f.height || parseHeightFromLabel(f.qualityLabel || f.resolution), 0),
-        fps: toNumber(f.fps, 0),
-        tbr: toNumber(f.tbr || f.bitrate || f.total_bitrate, 0),
-        abr: toNumber(f.abr || f.audioBitrate, 0),
-        vbr: toNumber(f.vbr, 0),
-        filesize: toNumber(f.filesize, 0),
-        filesize_approx: toNumber(f.filesize_approx, 0),
-        qualityLabel: String(f.qualityLabel || f.quality_label || f.resolution || ''),
-      };
-    })
-    .filter(Boolean)
-    .filter((f) => isNonEmptyString(f.url));
-
-  return uniqByKey(normalized, (f) =>
-    f.url ||
-    `${String(f.itag || '')}|${String(f.format_id || '')}|${String(f.height || '')}|${String(f.width || '')}|${String(f.mime || '')}`
-  );
+  return normalizeFormatList(sources);
 };
 
-const extractTitle = (raw = {}) =>
-  raw.title ||
-  raw.videoDetails?.title ||
-  raw.video_details?.title ||
-  raw.player_response?.videoDetails?.title ||
-  raw.basic_info?.title ||
-  raw.microformat?.title?.simpleText ||
-  (Array.isArray(raw.titleText?.runs) ? raw.titleText.runs.map((x) => x?.text || '').join('') : null) ||
-  raw.video?.title ||
-  null;
+const extractTitle = (raw = {}) => {
+  const title = raw[TITLE_PATH];
+  if (title) return title;
 
-const isLiveLike = (raw = {}, sd = {}) =>
-  Boolean(raw.is_live || raw.live_status === 'is_live' || raw.liveNow || raw.isLive || raw.live || sd.isLive);
+  const runs = getPathValue(raw, ['titleText', 'runs']);
+  const joined = concatTextRuns(runs);
+  if (joined) return joined;
+
+  const microformat = firstStringFromPaths(raw, [['microformat', 'title', 'simpleText']]);
+  if (microformat) return microformat;
+
+  return null;
+};
+
+const isLiveLike = (raw = {}, sd = {}) => {
+  const liveFlags = [
+    raw.is_live,
+    raw.liveNow,
+    raw.isLive,
+    raw.live,
+    sd.isLive,
+    sd.streamingData?.isLive,
+  ];
+
+  if (liveFlags.some((value) => value === true)) return true;
+
+  const status = firstNonEmptyString(raw.live_status, raw.liveStatus, sd.live_status, sd.liveStatus);
+  if (!status) return false;
+
+  const normalized = status.toLowerCase();
+  return normalized === 'is_live' || normalized === 'live' || normalized === 'live_now' || normalized === 'is-live';
+};
 
 const isHlsUrl = (url) => /(^|[/?#&])[^?#]*\.m3u8(\?|#|$)/i.test(url) || /mpegurl/i.test(url);
 const isDashUrl = (url) => /(^|[/?#&])[^?#]*\.mpd(\?|#|$)/i.test(url) || /dash/i.test(url);
 
-const extractManifest = (raw = {}, sd = {}, isLive = false) => {
-  const candidates = [
-    { kind: 'dash', url: sd.dashManifestUrl },
-    { kind: 'dash', url: sd.dash_manifest_url },
-    { kind: 'dash', url: sd.dashUrl },
-    { kind: 'hls', url: sd.hlsManifestUrl },
-    { kind: 'hls', url: sd.hls_manifest_url },
-    { kind: 'hls', url: sd.hlsUrl },
-    { kind: 'dash', url: raw.dashManifestUrl },
-    { kind: 'dash', url: raw.dash_manifest_url },
-    { kind: 'dash', url: raw.dashUrl },
-    { kind: 'hls', url: raw.hlsManifestUrl },
-    { kind: 'hls', url: raw.hls_manifest_url },
-    { kind: 'hls', url: raw.hlsUrl },
-    { kind: null, url: sd.manifestUrl },
-    { kind: null, url: sd.manifest_url },
-    { kind: null, url: raw.manifestUrl },
-    { kind: null, url: raw.manifest_url },
-  ].filter((x) => isNonEmptyString(x.url));
+const readManifestKey = (source, key) => firstNonEmptyString(source?.[key], source?.streamingData?.[key]);
 
-  if (!candidates.length) return null;
+const extractManifest = (raw = {}, sd = {}, preferLive = false) => {
+  const candidates = [];
 
-  const inferKind = (item) => {
-    if (item.kind) return item.kind;
-    if (isHlsUrl(item.url)) return 'hls';
-    if (isDashUrl(item.url)) return 'dash';
-    return 'hls';
-  };
+  for (const source of [sd, raw]) {
+    for (const group of MANIFEST_FIELD_GROUPS) {
+      const url = readManifestKey(source, group.key);
+      if (url) candidates.push({ kind: group.kind, url });
+    }
+  }
 
-  const ordered = candidates.map((item) => ({ url: item.url, kind: inferKind(item) }));
-  const preferredKinds = isLive ? ['hls', 'dash'] : ['dash', 'hls'];
+  const deduped = uniqByKey(candidates, (candidate) => candidate.url);
+  if (!deduped.length) return null;
 
+  const resolved = deduped.map((candidate) => {
+    if (candidate.kind) return candidate;
+    if (isHlsUrl(candidate.url)) return { ...candidate, kind: 'hls' };
+    if (isDashUrl(candidate.url)) return { ...candidate, kind: 'dash' };
+    return { ...candidate, kind: 'hls' };
+  });
+
+  const preferredKinds = preferLive ? ['hls', 'dash'] : ['dash', 'hls'];
   for (const kind of preferredKinds) {
-    const hit = ordered.find((x) => x.kind === kind);
+    const hit = resolved.find((candidate) => candidate.kind === kind);
     if (hit) return hit;
   }
 
-  return ordered[0];
+  return resolved[0];
 };
 
-const isMuxedFormat = (f) =>
-  Boolean(
-    f &&
-    ((f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none') ||
-      (String(f.mime || '').includes('video') && String(f.mime || '').includes('audio')) ||
-      f.kind === 'muxed')
-  );
+const hasPlayableUrl = (format) => isNonEmptyString(format?.url);
 
-const isVideoOnly = (f) =>
-  Boolean(
-    f &&
-    ((f.vcodec && f.vcodec !== 'none' && (!f.acodec || f.acodec === 'none')) ||
-      (String(f.mime || '').includes('video') && !String(f.mime || '').includes('audio')) ||
-      f.kind === 'video')
-  );
-
-const isAudioOnly = (f) =>
-  Boolean(
-    f &&
-    ((f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none')) ||
-      (String(f.mime || '').includes('audio') && !String(f.mime || '').includes('video')) ||
-      f.kind === 'audio')
-  );
-
-const scoreVideoFormat = (f) => [
-  toNumber(f.height, 0),
-  toNumber(f.width, 0),
-  toNumber(f.fps, 0),
-  toNumber(f.tbr || f.vbr || f.abr, 0),
-  toNumber(f.filesize_approx || f.filesize, 0),
-];
-
-const scoreAudioFormat = (f) => [
-  toNumber(f.abr, 0),
-  toNumber(f.tbr || f.vbr, 0),
-  toNumber(f.filesize_approx || f.filesize, 0),
-];
-
-const compareVideoQuality = (a, b) => {
-  const A = scoreVideoFormat(a);
-  const B = scoreVideoFormat(b);
-  for (let i = 0; i < A.length; i += 1) {
-    if (B[i] !== A[i]) return B[i] - A[i];
+const compareByRules = (rules) => (a, b) => {
+  for (const key of rules) {
+    const left = toNumber(a?.[key], 0);
+    const right = toNumber(b?.[key], 0);
+    if (left !== right) return right - left;
   }
   return 0;
 };
 
-const compareAudioQuality = (a, b) => {
-  const A = scoreAudioFormat(a);
-  const B = scoreAudioFormat(b);
-  for (let i = 0; i < A.length; i += 1) {
-    if (B[i] !== A[i]) return B[i] - A[i];
-  }
-  return 0;
+const compareVideoQuality = compareByRules(VIDEO_SCORE_RULES);
+const compareAudioQuality = compareByRules(AUDIO_SCORE_RULES);
+const compareMuxedQuality = compareVideoQuality;
+
+const selectBestByKind = (formats = [], kind, comparator, fallbackMatcher = null) => {
+  const playable = Array.isArray(formats) ? formats.filter(hasPlayableUrl) : [];
+  const byKind = playable.filter((format) => format.kind === kind);
+  if (byKind.length) return [...byKind].sort(comparator)[0] || null;
+
+  if (!fallbackMatcher) return null;
+  const fallback = playable.filter(fallbackMatcher);
+  return fallback.length ? [...fallback].sort(comparator)[0] || null : null;
 };
 
-const hasPlayableUrl = (f) => isNonEmptyString(f?.url);
+const mimeSuggestsVideoOnly = (format) => {
+  const text = `${format?.mime || ''} ${format?.vcodec || ''} ${format?.acodec || ''}`.toLowerCase();
+  return /video/.test(text) && !/audio/.test(text);
+};
 
-const selectBestMuxed = (formats = []) =>
-  [...formats].filter((f) => hasPlayableUrl(f) && isMuxedFormat(f)).sort(compareVideoQuality)[0] || null;
+const mimeSuggestsAudioOnly = (format) => {
+  const text = `${format?.mime || ''} ${format?.vcodec || ''} ${format?.acodec || ''}`.toLowerCase();
+  return /audio/.test(text) && !/video/.test(text);
+};
 
-const selectBestVideo = (formats = []) =>
-  [...formats].filter((f) => hasPlayableUrl(f) && isVideoOnly(f)).sort(compareVideoQuality)[0] ||
-  [...formats].filter((f) => hasPlayableUrl(f) && String(f.mime || '').includes('video')).sort(compareVideoQuality)[0] ||
-  null;
+const mimeSuggestsMuxed = (format) => {
+  const text = `${format?.mime || ''} ${format?.vcodec || ''} ${format?.acodec || ''}`.toLowerCase();
+  return /video/.test(text) && /audio/.test(text);
+};
 
-const selectBestAudio = (formats = []) =>
-  [...formats].filter((f) => hasPlayableUrl(f) && isAudioOnly(f)).sort(compareAudioQuality)[0] ||
-  [...formats].filter((f) => hasPlayableUrl(f) && String(f.mime || '').includes('audio')).sort(compareAudioQuality)[0] ||
-  null;
+const selectBestMuxed = (formats = []) => selectBestByKind(formats, 'muxed', compareMuxedQuality, mimeSuggestsMuxed);
+const selectBestVideo = (formats = []) => selectBestByKind(formats, 'video', compareVideoQuality, mimeSuggestsVideoOnly);
+const selectBestAudio = (formats = []) => selectBestByKind(formats, 'audio', compareAudioQuality, mimeSuggestsAudioOnly);
 
 const selectDashFromRequested = (raw = {}, sd = {}) => {
   const requested = pickRequestedFormats(raw, sd);
   if (requested.length < 2) return null;
 
-  const normalized = collectFormats({ requested_formats: requested }, {});
-  const video = normalized.find(isVideoOnly);
-  const audio = normalized.find(isAudioOnly);
+  const normalized = normalizeFormatList(requested);
+  const video = normalized.find((format) => format.kind === 'video');
+  const audio = normalized.find((format) => format.kind === 'audio');
 
-  if (video && audio) {
-    return {
-      kind: 'dash',
-      videourl: parseUrlFromFormat(video),
-      audiourl: parseUrlFromFormat(audio),
-      source: 'requested_formats',
-    };
-  }
+  if (!video || !audio) return null;
 
-  return null;
+  return {
+    kind: 'dash',
+    videourl: parseUrlFromFormat(video),
+    audiourl: parseUrlFromFormat(audio),
+    source: 'requested_formats',
+  };
 };
 
-const normalizeResourceChoice = (raw = {}, sd = {}, formatsOverride = null) => {
-  const formats = Array.isArray(formatsOverride) ? formatsOverride : collectFormats(raw, sd);
-  const live = isLiveLike(raw, sd);
+const buildStreamState = (raw = {}) => {
+  const sd = buildSdFromRaw(raw);
+  const formats = collectFormats(raw, sd);
+
+  return {
+    raw,
+    sd,
+    formats,
+    live: isLiveLike(raw, sd),
+    title: extractTitle(raw),
+  };
+};
+
+const normalizeResourceChoice = (state = {}) => {
+  const raw = state.raw || {};
+  const sd = state.sd || {};
+  const formats = Array.isArray(state.formats) ? state.formats : [];
+  const live = Boolean(state.live);
 
   if (live) {
     const manifest = extractManifest(raw, sd, true);
@@ -508,36 +577,46 @@ const runYtDlp = async (videoId, { useProxy = false } = {}) => {
   });
 };
 
-const badInstances = new Map();
-let rrIndex = 0;
+class InstancePool {
+  constructor(instances = [], banMs = INSTANCE_BAN_MS) {
+    this.instances = Array.isArray(instances) ? instances.slice() : [];
+    this.banMs = banMs;
+    this.badInstances = new Map();
+    this.rrIndex = 0;
+  }
 
-const markInstanceBad = (instance) => {
-  badInstances.set(instance, Date.now());
-};
+  markBad(instance) {
+    this.badInstances.set(instance, Date.now());
+  }
 
-const rotateInstances = (list = []) => {
-  if (!Array.isArray(list) || list.length === 0) return [];
+  rotate() {
+    if (!this.instances.length) return [];
 
-  const start = rrIndex % list.length;
-  rrIndex = (rrIndex + 1) % list.length;
+    const start = this.rrIndex % this.instances.length;
+    this.rrIndex = (this.rrIndex + 1) % this.instances.length;
 
-  const rotated = [...list.slice(start), ...list.slice(0, start)];
-  const now = Date.now();
+    const rotated = [...this.instances.slice(start), ...this.instances.slice(0, start)];
+    const now = Date.now();
 
-  const available = rotated.filter((instance) => {
-    const time = badInstances.get(instance);
-    if (!time) return true;
-    if (now - time > INSTANCE_BAN_MS) {
-      badInstances.delete(instance);
-      return true;
-    }
-    return false;
-  });
+    const available = rotated.filter((instance) => {
+      const timestamp = this.badInstances.get(instance);
+      if (!timestamp) return true;
 
-  return available.length ? available : rotated;
-};
+      if (now - timestamp > this.banMs) {
+        this.badInstances.delete(instance);
+        return true;
+      }
 
-const fastestFetch = async (instances, buildUrl, parser) => {
+      return false;
+    });
+
+    return available.length ? available : rotated;
+  }
+}
+
+const instancePool = new InstancePool(INVIDIOUS_INSTANCES);
+
+const fastestFetch = async (instances, buildUrl, parser, { markBad = () => {} } = {}) => {
   if (!Array.isArray(instances) || instances.length === 0) throw new Error('no instances');
 
   const controllers = [];
@@ -559,28 +638,19 @@ const fastestFetch = async (instances, buildUrl, parser) => {
           headers: { accept: 'application/json' },
         });
 
-        if (!res.ok) {
-          markInstanceBad(base);
-          throw new Error(`bad response ${res.status} from ${base}`);
-        }
+        if (!res.ok) throw new Error(`bad response ${res.status} from ${base}`);
 
         const json = await res.json();
-        if (!isPlainObject(json)) {
-          markInstanceBad(base);
-          throw new Error(`non-object JSON from ${base}`);
-        }
+        if (!isPlainObject(json)) throw new Error(`non-object JSON from ${base}`);
 
         const parsed = parser(json);
-        if (!parsed) {
-          markInstanceBad(base);
-          throw new Error(`parse failed from ${base}`);
-        }
+        if (!parsed) throw new Error(`parse failed from ${base}`);
 
         return { instance: base, data: parsed };
       } catch (err) {
         const aborted = err?.name === 'AbortError';
         if (!(err instanceof SkipInstanceError) && (timedOut || !aborted)) {
-          markInstanceBad(base);
+          markBad(base);
         }
         throw err;
       } finally {
@@ -602,24 +672,20 @@ const fastestFetch = async (instances, buildUrl, parser) => {
 const parseInvidiousVideo = (data) => {
   if (!isPlainObject(data)) return null;
 
-  const sd = buildSdFromRaw(data);
-  const formats = collectFormats(data, sd);
-  const live = Boolean(
-    data.liveNow || data.isLive || data.is_live || data.live || data.live_status === 'is_live' || sd.streamingData?.isLive
-  );
-
-  if (live) {
+  const state = buildStreamState(data);
+  if (state.live) {
     throw new SkipInstanceError('skip live on invidious');
   }
 
   return {
+    state,
     streaming_data: {
-      ...sd,
-      formats,
+      ...state.sd,
+      formats: state.formats,
     },
-    is_live: live,
+    is_live: state.live,
     raw: data,
-    formats,
+    formats: state.formats,
   };
 };
 
@@ -627,29 +693,30 @@ const fetchFromYtDlp = async (id, { useProxy = false } = {}) => {
   const raw = await runYtDlp(id, { useProxy });
   if (!isPlainObject(raw)) throw new Error('yt-dlp returned non-object JSON');
 
-  const sd = buildSdFromRaw(raw);
-  const formats = collectFormats(raw, sd);
-  const live = isLiveLike(raw, sd);
+  const state = buildStreamState(raw);
 
   return {
+    state,
     provider: useProxy ? 'yt-dlp (proxy)' : 'yt-dlp (direct)',
-    streaming_data: sd,
-    is_live: live,
+    streaming_data: state.sd,
+    is_live: state.live,
     raw,
-    formats,
+    formats: state.formats,
   };
 };
 
 const fetchFromInvidious = async (id) => {
-  const instances = rotateInstances(INVIDIOUS_INSTANCES);
+  const instances = instancePool.rotate();
 
   const result = await fastestFetch(
     instances,
     (base) => `${base.replace(/\/$/, '')}/api/v1/videos/${id}`,
-    parseInvidiousVideo
+    parseInvidiousVideo,
+    { markBad: (instance) => instancePool.markBad(instance) }
   );
 
   return {
+    state: result.data.state,
     provider: result.instance,
     streaming_data: result.data.streaming_data,
     is_live: result.data.is_live,
@@ -676,12 +743,28 @@ const fetchStreamingInfo = async (id) => {
   return fetchFromYtDlp(id, { useProxy: false });
 };
 
-const buildStreamResponse = ({ info, raw, sd, title, res }) => {
-  const formats = collectFormats(raw, sd);
-  const live = isLiveLike(raw, sd);
-  const effectiveFormats = formats.length ? formats : Array.isArray(info?.formats) ? info.formats : [];
+const getStateFromInfo = (info = {}) => {
+  if (info.state && isPlainObject(info.state)) return info.state;
 
-  if (live) {
+  const raw = info.raw || {};
+  const sd = info.streaming_data || {};
+  const formats = Array.isArray(info.formats) ? info.formats : collectFormats(raw, sd);
+
+  return {
+    raw,
+    sd,
+    formats,
+    live: isLiveLike(raw, sd),
+    title: extractTitle(raw),
+  };
+};
+
+const buildStreamResponse = ({ info, title, res }) => {
+  const state = getStateFromInfo(info);
+  const raw = state.raw || {};
+  const sd = state.sd || {};
+
+  if (state.live) {
     const manifest = extractManifest(raw, sd, true);
     if (!manifest) {
       return res.status(404).json({ error: 'no stream' });
@@ -695,11 +778,12 @@ const buildStreamResponse = ({ info, raw, sd, title, res }) => {
     });
   }
 
+  const effectiveFormats = Array.isArray(state.formats) ? state.formats : [];
   if (!effectiveFormats.length) {
     return res.status(404).json({ error: 'no stream' });
   }
 
-  const choice = normalizeResourceChoice(raw, sd, effectiveFormats);
+  const choice = normalizeResourceChoice(state);
   if (!choice) {
     return res.status(404).json({ error: 'no stream' });
   }
@@ -736,11 +820,9 @@ app.get('/api/stream', async (req, res) => {
     if (!YT_ID_REGEX.test(id)) return res.status(400).json({ error: 'invalid video id' });
 
     const info = await fetchStreamingInfo(id);
-    const sd = info.streaming_data || {};
-    const raw = info.raw || {};
-    const title = extractTitle(raw) || '';
+    const title = extractTitle(info.raw || {}) || '';
 
-    return buildStreamResponse({ info, raw, sd, title, res });
+    return buildStreamResponse({ info, title, res });
   } catch (error) {
     console.error('Unexpected error in /api/stream', error);
     return res.status(500).json({ error: error?.message || 'internal error' });
