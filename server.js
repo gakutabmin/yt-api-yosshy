@@ -45,6 +45,7 @@ const TITLE_PATH = 'title';
 const MANIFEST_FIELD_GROUPS = [
   { kind: 'dash', key: 'dashUrl' },
   { kind: 'hls', key: 'hlsUrl' },
+  { kind: 'hls', key: 'manifest_url' },
 ];
 
 const VIDEO_SCORE_RULES = ['height', 'width', 'fps', 'tbr', 'filesize_approx', 'filesize'];
